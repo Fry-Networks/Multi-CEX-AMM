@@ -1,0 +1,14 @@
+# Multi-CEX-AMM Bot Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core async HTTP client
+aiohttp>=3.8.0,<4.0.0
+
+# Optional: For better async performance on Windows
+aiohttp[speedups]>=3.8.0,<4.0.0; sys_platform != 'win32'
+
+# Optional: For YAML config support (alternative to JSON)
+pyyaml>=6.0.0
+
+# Optional: For environment variable loading
+python-dotenv>=1.0.0

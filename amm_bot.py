@@ -8,8 +8,15 @@ deep liquidity on both sides of the order book.
 
 Usage:
     1. Install dependencies: pip install aiohttp
-    2. Configure your API keys and markets below
+    2. Configure your API keys in config.json (copy from config.example.json)
     3. Run: python amm_bot.py
+
+    Or use the launcher scripts:
+    - Linux/macOS: ./run_bot.sh --setup && ./run_bot.sh
+    - Windows: run_bot.bat --setup && run_bot.bat
+
+Supported Platforms: Linux, macOS, Windows
+Python Version: 3.8+
 """
 
 import asyncio
@@ -17,15 +24,32 @@ import hashlib
 import hmac
 import json
 import logging
+import os
+import platform
 import signal
 import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
-from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+# =============================================================================
+# VERSION AND PLATFORM CHECKS
+# =============================================================================
+
+MIN_PYTHON_VERSION = (3, 8)
+__version__ = "1.0.0"
+
+if sys.version_info < MIN_PYTHON_VERSION:
+    print(f"ERROR: Python {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]}+ is required.")
+    print(f"Current version: {sys.version_info.major}.{sys.version_info.minor}")
+    sys.exit(1)
+
+IS_WINDOWS = platform.system() == "Windows"
 
 try:
     import aiohttp
@@ -127,15 +151,120 @@ CONFIG = {
 
 
 # =============================================================================
+# CONFIGURATION LOADING
+# =============================================================================
+
+def get_config_path() -> Optional[Path]:
+    """Find config.json in the script directory or current directory."""
+    script_dir = Path(__file__).parent
+
+    # Check script directory first
+    config_path = script_dir / "config.json"
+    if config_path.exists():
+        return config_path
+
+    # Check current directory
+    config_path = Path.cwd() / "config.json"
+    if config_path.exists():
+        return config_path
+
+    return None
+
+
+def load_config() -> Dict:
+    """Load configuration from config.json or use defaults."""
+    config_path = get_config_path()
+
+    if config_path:
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                loaded_config = json.load(f)
+
+            # Remove any comment fields
+            if '_comment' in loaded_config:
+                del loaded_config['_comment']
+
+            # Merge with defaults (loaded config takes precedence)
+            merged = CONFIG.copy()
+
+            # Deep merge for nested dicts
+            for key, value in loaded_config.items():
+                if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+                    merged[key].update(value)
+                else:
+                    merged[key] = value
+
+            print(f"Loaded configuration from: {config_path}")
+            return merged
+
+        except json.JSONDecodeError as e:
+            print(f"ERROR: Invalid JSON in config file: {e}")
+            print("Using default configuration.")
+        except Exception as e:
+            print(f"ERROR: Failed to load config file: {e}")
+            print("Using default configuration.")
+
+    return CONFIG
+
+
+# Load configuration (use external file if available)
+ACTIVE_CONFIG = load_config()
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def utc_now() -> datetime:
+    """Get current UTC time (compatible with Python 3.8-3.12+)."""
+    return datetime.now(timezone.utc)
+
+
+def format_timestamp(dt: datetime) -> str:
+    """Format datetime for logging."""
+    return dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+
+# =============================================================================
 # LOGGING SETUP
 # =============================================================================
 
-logging.basicConfig(
-    level=getattr(logging, CONFIG["log_level"]),
-    format='%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger("AMM")
+def setup_logging(config: Dict) -> logging.Logger:
+    """Configure logging based on settings."""
+    log_level = getattr(logging, config.get("log_level", "INFO").upper(), logging.INFO)
+    log_format = '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s'
+    date_format = '%Y-%m-%d %H:%M:%S'
+
+    handlers: List[logging.Handler] = []
+
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter(log_format, date_format))
+    handlers.append(console_handler)
+
+    # File handler (if configured)
+    log_file = config.get("log_file")
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler.setFormatter(logging.Formatter(log_format, date_format))
+            handlers.append(file_handler)
+        except Exception as e:
+            print(f"Warning: Could not create log file {log_file}: {e}")
+
+    # Configure root logger
+    logging.basicConfig(
+        level=log_level,
+        format=log_format,
+        datefmt=date_format,
+        handlers=handlers,
+        force=True  # Override any existing configuration
+    )
+
+    return logging.getLogger("AMM")
+
+
+logger = setup_logging(ACTIVE_CONFIG)
 
 
 # =============================================================================
@@ -175,7 +304,7 @@ class OrderBook:
     symbol: str
     bids: List[OrderBookLevel] = field(default_factory=list)
     asks: List[OrderBookLevel] = field(default_factory=list)
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=utc_now)
     
     @property
     def best_bid(self) -> Optional[Decimal]:
@@ -215,7 +344,7 @@ class Order:
     filled_quantity: Decimal = Decimal("0")
     remaining_quantity: Decimal = Decimal("0")
     status: OrderStatus = OrderStatus.PENDING
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utc_now)
     exchange: str = ""
     
     @property
@@ -276,14 +405,28 @@ class OrderLadder:
 # =============================================================================
 
 class RateLimiter:
+    """
+    Async-safe rate limiter for API requests.
+
+    Note: The asyncio.Lock is created lazily on first acquire() to ensure
+    it's created in the correct event loop context.
+    """
+
     def __init__(self, requests_per_second: float = 5.0):
         self.requests_per_second = requests_per_second
         self.min_interval = 1.0 / requests_per_second
         self.last_request_time = 0.0
-        self._lock = asyncio.Lock()
-    
-    async def acquire(self):
-        async with self._lock:
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Get or create the lock (must be called from async context)."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def acquire(self) -> None:
+        """Acquire rate limit slot, waiting if necessary."""
+        async with self._get_lock():
             now = time.time()
             elapsed = now - self.last_request_time
             if elapsed < self.min_interval:
@@ -400,41 +543,63 @@ class ExchangeConnector(ABC):
         pass
     
     def _parse_decimal(self, value: Any) -> Decimal:
+        """Parse a value to Decimal safely."""
         if value is None:
             return Decimal("0")
         if isinstance(value, Decimal):
             return value
         try:
             return Decimal(str(value))
-        except:
+        except (InvalidOperation, ValueError, TypeError) as e:
+            self.logger.debug(f"Failed to parse decimal value '{value}': {e}")
             return Decimal("0")
-    
+
     def _parse_timestamp(self, value: Any) -> datetime:
+        """Parse a timestamp value to datetime safely."""
         if isinstance(value, datetime):
+            # Ensure timezone awareness
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
             return value
         if isinstance(value, (int, float)):
-            if value > 1e12:
-                value = value / 1000
-            return datetime.fromtimestamp(value)
+            try:
+                # Handle milliseconds vs seconds
+                if value > 1e12:
+                    value = value / 1000
+                return datetime.fromtimestamp(value, tz=timezone.utc)
+            except (ValueError, OSError, OverflowError) as e:
+                self.logger.debug(f"Failed to parse timestamp value '{value}': {e}")
+                return utc_now()
         if isinstance(value, str):
             try:
+                # Handle ISO format with Z suffix
                 return datetime.fromisoformat(value.replace('Z', '+00:00'))
-            except:
-                return datetime.utcnow()
-        return datetime.utcnow()
-    
+            except ValueError as e:
+                self.logger.debug(f"Failed to parse timestamp string '{value}': {e}")
+                return utc_now()
+        return utc_now()
+
     def _hmac_sha256(self, message: str) -> str:
+        """Generate HMAC-SHA256 signature."""
         return hmac.new(
             self.api_secret.encode('utf-8'),
             message.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
-    
+
     def round_price(self, price: Decimal, precision: int = 8) -> Decimal:
-        return round(price, precision)
-    
+        """Round price down to specified precision (avoids overpaying)."""
+        if precision < 0:
+            precision = 0
+        quantize_str = '0.' + '0' * precision if precision > 0 else '1'
+        return price.quantize(Decimal(quantize_str), rounding=ROUND_DOWN)
+
     def round_quantity(self, quantity: Decimal, precision: int = 8) -> Decimal:
-        return round(quantity, precision)
+        """Round quantity down to specified precision (avoids overselling)."""
+        if precision < 0:
+            precision = 0
+        quantize_str = '0.' + '0' * precision if precision > 0 else '1'
+        return quantity.quantize(Decimal(quantize_str), rounding=ROUND_DOWN)
 
 
 # =============================================================================
@@ -925,7 +1090,7 @@ class MarketMaker:
         self.buy_orders: List[Order] = []
         self.sell_orders: List[Order] = []
         self.last_mid_price: Optional[Decimal] = None
-        self.last_update = datetime.utcnow()
+        self.last_update = utc_now()
         
         self.logger = logging.getLogger(f"AMM.{connector.name}.{market_config.symbol}")
     
@@ -1112,7 +1277,7 @@ class MarketMaker:
             return (0, 0)
         
         self.last_mid_price = order_book.mid_price
-        self.last_update = datetime.utcnow()
+        self.last_update = utc_now()
         
         # Cancel existing orders
         cancelled = await self._cancel_all_orders()
@@ -1307,8 +1472,8 @@ class AMMBot:
             return
         
         self.running = True
-        self.start_time = datetime.utcnow()
-        
+        self.start_time = utc_now()
+
         await self._run_loop()
     
     async def _run_loop(self):
@@ -1338,7 +1503,7 @@ class AMMBot:
     
     def _log_status(self):
         """Log current status."""
-        runtime = datetime.utcnow() - self.start_time if self.start_time else None
+        runtime = utc_now() - self.start_time if self.start_time else None
         
         logger.info("-" * 50)
         logger.info("BOT STATUS")
@@ -1377,48 +1542,151 @@ class AMMBot:
 # MAIN ENTRY POINT
 # =============================================================================
 
-async def main():
-    """Main entry point."""
-    bot = AMMBot(CONFIG)
-    
-    loop = asyncio.get_event_loop()
-    
-    def signal_handler():
-        logger.info("Received shutdown signal")
-        asyncio.create_task(bot.stop())
-    
-    for sig in (signal.SIGINT, signal.SIGTERM):
+class GracefulShutdown:
+    """
+    Cross-platform graceful shutdown handler.
+
+    On Unix: Uses asyncio signal handlers
+    On Windows: Uses a background thread to monitor for Ctrl+C
+    """
+
+    def __init__(self, bot: AMMBot):
+        self.bot = bot
+        self.shutdown_event = asyncio.Event()
+        self._shutdown_requested = False
+
+    def request_shutdown(self) -> None:
+        """Request graceful shutdown."""
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+        logger.info("Shutdown requested...")
+
+        # Set event in thread-safe manner
         try:
-            loop.add_signal_handler(sig, signal_handler)
-        except NotImplementedError:
-            signal.signal(sig, lambda s, f: signal_handler())
-    
+            loop = asyncio.get_running_loop()
+            loop.call_soon_threadsafe(self.shutdown_event.set)
+        except RuntimeError:
+            # No running loop, set directly
+            self.shutdown_event.set()
+
+    async def wait_for_shutdown(self) -> None:
+        """Wait for shutdown signal."""
+        await self.shutdown_event.wait()
+
+    def setup_signal_handlers(self) -> None:
+        """Set up signal handlers based on platform."""
+        if IS_WINDOWS:
+            self._setup_windows_handlers()
+        else:
+            self._setup_unix_handlers()
+
+    def _setup_unix_handlers(self) -> None:
+        """Set up Unix signal handlers."""
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self.request_shutdown)
+            logger.debug("Unix signal handlers installed")
+        except Exception as e:
+            logger.warning(f"Could not install Unix signal handlers: {e}")
+            # Fall back to basic signal handling
+            signal.signal(signal.SIGINT, lambda s, f: self.request_shutdown())
+            signal.signal(signal.SIGTERM, lambda s, f: self.request_shutdown())
+
+    def _setup_windows_handlers(self) -> None:
+        """Set up Windows signal handlers."""
+        # On Windows, we use traditional signal handlers
+        # They work for Ctrl+C but not for asyncio event loop integration
+        def win_handler(signum: int, frame: Any) -> None:
+            self.request_shutdown()
+
+        signal.signal(signal.SIGINT, win_handler)
+        signal.signal(signal.SIGTERM, win_handler)
+        logger.debug("Windows signal handlers installed")
+
+
+async def run_bot(config: Dict) -> None:
+    """Run the bot with proper shutdown handling."""
+    bot = AMMBot(config)
+    shutdown = GracefulShutdown(bot)
+    shutdown.setup_signal_handlers()
+
     try:
-        await bot.start()
+        # Start bot in a task
+        bot_task = asyncio.create_task(bot.start())
+
+        # Wait for either bot completion or shutdown signal
+        shutdown_task = asyncio.create_task(shutdown.wait_for_shutdown())
+
+        done, pending = await asyncio.wait(
+            [bot_task, shutdown_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        # If shutdown was requested, stop the bot
+        if shutdown_task in done:
+            await bot.stop()
+            if not bot_task.done():
+                bot_task.cancel()
+                try:
+                    await bot_task
+                except asyncio.CancelledError:
+                    pass
+
+        # If bot completed (error or normally), cancel shutdown wait
+        if bot_task in done:
+            shutdown_task.cancel()
+            try:
+                await shutdown_task
+            except asyncio.CancelledError:
+                pass
+
+            # Re-raise any exception from the bot
+            if bot_task.exception():
+                raise bot_task.exception()
+
+    except asyncio.CancelledError:
+        logger.info("Bot task cancelled")
     except Exception as e:
-        logger.error(f"Bot crashed: {e}")
+        logger.error(f"Bot error: {e}")
+        raise
     finally:
-        await bot.stop()
+        # Ensure cleanup
+        if bot.running:
+            await bot.stop()
 
 
-if __name__ == "__main__":
+async def main() -> None:
+    """Main entry point."""
+    await run_bot(ACTIVE_CONFIG)
+
+
+def main_entry() -> None:
+    """Entry point for console script (pyproject.toml)."""
     print("""
 ╔═══════════════════════════════════════════════════════════════╗
-║           MULTI-EXCHANGE AMM BOT                              ║
+║           MULTI-EXCHANGE AMM BOT v{}                        ║
 ║                                                               ║
 ║   Exchanges: NonKYC | Bitstorage | Exbitron                   ║
 ║                                                               ║
-║   Configure your API keys in the CONFIG section above,        ║
-║   then set 'enabled: True' for your exchanges.                ║
+║   Configuration:                                              ║
+║   - Copy config.example.json to config.json                   ║
+║   - Edit config.json with your API credentials                ║
+║   - Set 'enabled: true' for your exchanges                    ║
 ║                                                               ║
-║   Start with dry_run=True to test without placing orders.     ║
+║   Start with dry_run=true to test without placing orders.     ║
 ╚═══════════════════════════════════════════════════════════════╝
-    """)
-    
+    """.format(__version__))
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nBot stopped by user")
     except Exception as e:
-        print(f"Fatal error: {e}")
+        logger.exception(f"Fatal error: {e}")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main_entry()

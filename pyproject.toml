@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi-cex-amm"
+version = "1.0.0"
+description = "Multi-Exchange Automated Market Maker Bot for NonKYC, Bitstorage, and Exbitron"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Multi-CEX-AMM Team"}
+]
+keywords = ["crypto", "trading", "amm", "market-maker", "bot", "exchange"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "aiohttp>=3.8.0,<4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+    "flake8>=6.0.0",
+]
+yaml = [
+    "pyyaml>=6.0.0",
+]
+dotenv = [
+    "python-dotenv>=1.0.0",
+]
+all = [
+    "pyyaml>=6.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+amm-bot = "amm_bot:main_entry"
+
+[project.urls]
+"Homepage" = "https://github.com/Fry-Foundation/Multi-CEX-AMM"
+"Bug Tracker" = "https://github.com/Fry-Foundation/Multi-CEX-AMM/issues"
+
+[tool.setuptools]
+py-modules = ["amm_bot"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
